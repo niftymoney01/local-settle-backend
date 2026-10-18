@@ -43,10 +43,15 @@ import {
 } from '../file-storage/file-storage.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
+import { createHash } from 'crypto';
 
 @Injectable()
 export class EscrowService {
   private readonly logger = new Logger(EscrowService.name);
+  private readonly evidenceUsage = new Map<
+    string,
+    { bytes: number; expiresAt: number }
+  >();
 
   constructor(
     private readonly repo: EscrowRepository,
@@ -406,7 +411,7 @@ export class EscrowService {
     };
   }
 
-  async uploadEvidence(id: string, file?: UploadFileInput) {
+  async uploadEvidence(id: string, file?: UploadFileInput, userId?: string) {
     if (!file || !file.buffer) {
       throw new AppException(
         ErrorCode.VALIDATION_ERROR,
@@ -427,21 +432,96 @@ export class EscrowService {
       );
     }
 
+    const isPng =
+      file.buffer.length >= 8 &&
+      file.buffer.subarray(0, 8).equals(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+    const isJpeg =
+      file.buffer.length >= 3 &&
+      file.buffer[0] === 0xff &&
+      file.buffer[1] === 0xd8 &&
+      file.buffer[2] === 0xff;
+    const isWebp =
+      file.buffer.length >= 12 &&
+      file.buffer.toString('ascii', 0, 4) === 'RIFF' &&
+      file.buffer.toString('ascii', 8, 12) === 'WEBP';
+    const isPdf = file.buffer.subarray(0, 5).toString('ascii') === '%PDF-';
+    const signatureMatchesMime =
+      (file.mimetype === 'image/png' && isPng) ||
+      (file.mimetype === 'image/jpeg' && isJpeg) ||
+      (file.mimetype === 'image/webp' && isWebp) ||
+      (file.mimetype === 'application/pdf' && isPdf);
+
+    if (!signatureMatchesMime) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Evidence content does not match an allowed file type',
+      );
+    }
+
     const escrow = await this.getOrFail(id);
+    if (!userId) {
+      throw new AppException(
+        ErrorCode.UNAUTHORIZED_ACTION,
+        'Authenticated user is required to upload evidence',
+      );
+    }
+    const maxFileBytes =
+      Number(this.config.get('EVIDENCE_MAX_FILE_BYTES')) || 10 * 1024 * 1024;
+    const userLimit =
+      Number(this.config.get('EVIDENCE_USER_DAILY_BYTES')) || 50 * 1024 * 1024;
+    const orderLimit =
+      Number(this.config.get('EVIDENCE_ORDER_DAILY_BYTES')) || 20 * 1024 * 1024;
+    const now = Date.now();
+    const expiresAt = now + 24 * 60 * 60 * 1000;
+    const userKey = `user:${userId}`;
+    const orderKey = `order:${escrow.orderId}`;
+    const userUsage = this.getEvidenceUsage(userKey, now, expiresAt);
+    const orderUsage = this.getEvidenceUsage(orderKey, now, expiresAt);
+    if (
+      file.size > maxFileBytes ||
+      userUsage.bytes + file.size > userLimit ||
+      orderUsage.bytes + file.size > orderLimit
+    ) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Evidence upload quota exceeded',
+      );
+    }
+    // Reserve synchronously before the first await so concurrent requests cannot
+    // both pass the same quota check. Failed uploads release this reservation.
+    userUsage.bytes += file.size;
+    orderUsage.bytes += file.size;
     const ext = file.originalname.split('.').pop() || 'jpg';
     const key = `evidence/${escrow.escrowId}/${Date.now()}.${ext}`;
 
-    const result = await this.fileStorage.uploadFile({
-      originalname: file.originalname,
-      mimetype: file.mimetype,
-      buffer: file.buffer,
-      size: file.size,
-      key,
-    });
+    try {
+      const result = await this.fileStorage.uploadFile({
+        originalname: file.originalname,
+        mimetype: file.mimetype,
+        buffer: file.buffer,
+        size: file.size,
+        key,
+      });
+      await this.repo.update(id, { evidenceUrl: result.url });
+      return { url: result.url };
+    } catch (error) {
+      userUsage.bytes -= file.size;
+      orderUsage.bytes -= file.size;
+      throw error;
+    }
+  }
 
-    await this.repo.update(id, { evidenceUrl: result.url });
-
-    return { url: result.url };
+  private getEvidenceUsage(key: string, now: number, expiresAt: number) {
+    for (const [usageKey, usage] of this.evidenceUsage) {
+      if (usage.expiresAt <= now) this.evidenceUsage.delete(usageKey);
+    }
+    const current = this.evidenceUsage.get(key);
+    if (current && current.expiresAt > now) return current;
+    const fresh = { bytes: 0, expiresAt };
+    this.evidenceUsage.set(key, fresh);
+    return fresh;
   }
 
   async release(dto: ReleaseEscrowDto) {
@@ -509,6 +589,24 @@ export class EscrowService {
 
   async syncTransaction(dto: SyncEscrowDto) {
     const escrow = await this.getOrFail(dto.escrowId);
+    const transactionHash = createHash('sha256')
+      .update(dto.signedXdr)
+      .digest('hex');
+
+    if (escrow.lastSyncTxHash === transactionHash) {
+      if (escrow.lastSyncAction !== dto.action) {
+        throw new AppException(
+          ErrorCode.INVALID_ORDER_STATUS,
+          'This signed transaction was already used for a different escrow action.',
+        );
+      }
+      return {
+        escrowId: dto.escrowId,
+        status: 'SUCCESS',
+        contractId: escrow.contractId,
+        newEscrowStatus: escrow.escrowStatus,
+      };
+    }
 
     this.validateStatusTransition(escrow.escrowStatus, dto.action);
 
@@ -521,6 +619,8 @@ export class EscrowService {
     }
 
     const updateData: Record<string, unknown> = {};
+    updateData.lastSyncTxHash = transactionHash;
+    updateData.lastSyncAction = dto.action;
     switch (dto.action) {
       case EscrowAction.INITIALIZE:
         updateData.escrowStatus = 'initialized';
